@@ -1,0 +1,25 @@
+# Local overrides and editor noise — never commit secrets or state
+*.local
+*.orig
+*.rej
+*~
+
+# Prometheus
+data/
+wal/
+
+# Grafana provisioning leftovers
+grafana/provisioning/dashboards/*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets — alert rule files must never contain tokens or webhook URLs
+*.pem
+*.key
+secrets.yaml
+secrets.yml
+.env

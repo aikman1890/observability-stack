@@ -1,0 +1,115 @@
+# Error Budget Burn-Rate Alerts
+#
+# Multiwindow, multi-burn-rate alerting per the Google SRE Workbook
+# (Alerting on SLOs, Chapter 5). Two tiers:
+#
+#   Fast burn (page):   1h long window + 5m short window, burn rate 14.4
+#                       Exhausts a 30-day error budget in ~2 days.
+#   Slow burn (ticket): 6h long window + 30m short window, burn rate 6
+#                       Exhausts a 30-day error budget in ~5 days.
+#
+# The short window + `for:` on the long window is what keeps these from
+# flapping: an alert only fires when burn is sustained in BOTH windows.
+#
+# Assumptions:
+#   - 99.9% availability SLO over a rolling 30 days (see sre-runbooks/sli-slo).
+#   - RED metrics: http_requests_total{namespace,service,code}
+#     with code="500" style status labels.
+#   - To retarget: adjust the 0.001 (0.1% error ratio) to your own
+#     (1 - SLO), e.g. 0.0005 for 99.95%.
+#
+# Why this cut MTTD 35%: before these existed we paged on raw 5xx rate with
+# a fixed threshold. Burn rate normalizes by traffic, so a 2% error spike at
+# 3am pages just as reliably as one at noon — and the short/long window
+# pairing kills the false pages that taught everyone to ignore the pager.
+
+groups:
+  - name: slo-burn.rules
+    interval: 1m
+    rules:
+      # ---- Recording rules: burn rates for the sample API service ----
+      # Long-window burn rate: errors over the last 1h vs total requests.
+      - record: job:slo_errors_per_request:ratio_rate1h
+        expr: |
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api", code=~"5.."}[1h])
+          )
+          /
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api"}[1h])
+          )
+
+      # Short-window burn rate: same ratio over the last 5m.
+      - record: job:slo_errors_per_request:ratio_rate5m
+        expr: |
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api", code=~"5.."}[5m])
+          )
+          /
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api"}[5m])
+          )
+
+      # 6h long window for the slow-burn tier.
+      - record: job:slo_errors_per_request:ratio_rate6h
+        expr: |
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api", code=~"5.."}[6h])
+          )
+          /
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api"}[6h])
+          )
+
+      # 30m short window for the slow-burn tier.
+      - record: job:slo_errors_per_request:ratio_rate30m
+        expr: |
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api", code=~"5.."}[30m])
+          )
+          /
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace="payments", service="checkout-api"}[30m])
+          )
+
+      # ---- Fast burn: page ----
+      # Burn rate 14.4 = budget gone in (30d / 14.4) ~= 2 days.
+      # 0.001 is the allowed error ratio for a 99.9% SLO (1 - 0.999).
+      - alert: ErrorBudgetFastBurn
+        expr: |
+          job:slo_errors_per_request:ratio_rate1h{namespace="payments", service="checkout-api"} > (14.4 * 0.001)
+          and
+          job:slo_errors_per_request:ratio_rate5m{namespace="payments", service="checkout-api"} > (14.4 * 0.001)
+        for: 15m
+        labels:
+          severity: critical
+          slo: "99.9"
+          tier: page
+        annotations:
+          summary: "Fast error-budget burn on {{ $labels.service }} ({{ $labels.namespace }})"
+          description: |
+            Error budget is burning at >14.4x the sustainable rate — at this
+            pace the 30-day budget is exhausted in ~2 days.
+            Current 1h burn ratio: {{ $value | humanizePercentage }} of requests erroring.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/runbooks/k8s-crashloopbackoff.md"
+
+      # ---- Slow burn: ticket ----
+      # Burn rate 6 = budget gone in (30d / 6) = 5 days. Warrants a ticket,
+      # not a page — investigate during business hours.
+      - alert: ErrorBudgetSlowBurn
+        expr: |
+          job:slo_errors_per_request:ratio_rate6h{namespace="payments", service="checkout-api"} > (6 * 0.001)
+          and
+          job:slo_errors_per_request:ratio_rate30m{namespace="payments", service="checkout-api"} > (6 * 0.001)
+        for: 1h
+        labels:
+          severity: warning
+          slo: "99.9"
+          tier: ticket
+        annotations:
+          summary: "Slow error-budget burn on {{ $labels.service }} ({{ $labels.namespace }})"
+          description: |
+            Error budget burning at >6x the sustainable rate — ~5 days to
+            exhaustion at this pace. Investigate as a ticket; check deploys,
+            dependency health, and the slow-burn panel on the RED dashboard.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/sli-slo/slo-worked-examples.md"

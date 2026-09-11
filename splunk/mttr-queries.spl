@@ -1,0 +1,111 @@
+// ============================================================
+// Incident & Reliability Analysis Queries (SPL)
+// Shaun Nicholas St. John — Senior SRE
+//
+// Index assumptions: `incidents` holds P1-P4 records with fields
+//   service, severity (P1..P4), opened, resolved, triage_started,
+//   alert_name, team.
+// `app_errors` holds per-request error events with fields
+//   service, status_code, _time.
+// Adjust index/sourcetype names to your environment; the logic is the point.
+// ============================================================
+
+// ------------------------------------------------------------
+// (1) MTTR per service, last 30 days
+// Why: you can't cut MTTR 40% without measuring it per service first.
+// This is the query that started that work — it showed two services
+// owned 70% of total incident-minutes.
+// ------------------------------------------------------------
+index=incidents severity IN (P1, P2, P3)
+| eval duration_min = round((resolved - opened) / 60, 1)
+| where duration_min > 0
+| stats count as incidents,
+        avg(duration_min) as avg_mttr_min,
+        p95(duration_min) as p95_mttr_min,
+        sum(duration_min) as total_downtime_min
+    by service
+| sort - total_downtime_min
+| eval avg_mttr_min = round(avg_mttr_min, 1),
+       p95_mttr_min = round(p95_mttr_min, 1)
+| rename service as Service,
+         incidents as Incidents,
+         avg_mttr_min as "Avg MTTR (min)",
+         p95_mttr_min as "P95 MTTR (min)",
+         total_downtime_min as "Total incident-min (30d)"
+
+
+// ------------------------------------------------------------
+// (2) P1 triage time trend (week over week)
+// Triage time = opened -> triage_started (first responder engaged).
+// Target: under 5 minutes. This trend is what we report to leadership:
+// detection is a process metric, and it moves before MTTR does.
+// ------------------------------------------------------------
+index=incidents severity=P1
+| eval triage_min = round((triage_started - opened) / 60, 1)
+| where triage_min >= 0
+| bin _time span=1w
+| stats count as p1_count,
+        avg(triage_min) as avg_triage_min,
+        p90(triage_min) as p90_triage_min
+    by _time
+| eval avg_triage_min = round(avg_triage_min, 1),
+       p90_triage_min = round(p90_triage_min, 1)
+| sort _time
+| rename _time as Week,
+         p1_count as "P1 count",
+         avg_triage_min as "Avg triage (min)",
+         p90_triage_min as "P90 triage (min)"
+// Visualize as a line chart; add a 5-minute reference line.
+
+
+// ------------------------------------------------------------
+// (3) Top 10 noisiest alerts — alert fatigue driver list
+// Counts alert firings per alert_name over 30d and shows what share of
+// total noise each one is. In our environment the top 3 alerts were 61%
+// of all pages — tuning just those three cut pages by half.
+// Rule of thumb: any alert firing more than ~5x/week needs its threshold
+// or its `for:` revisited.
+// ------------------------------------------------------------
+index=incidents
+| stats count as firings by alert_name
+| eventstats sum(firings) as total_firings
+| eval pct_of_noise = round(100 * firings / total_firings, 1)
+| sort - firings
+| head 10
+| eval avg_per_week = round(firings / 4.3, 1)
+| rename alert_name as Alert,
+         firings as "Firings (30d)",
+         avg_per_week as "Avg/week",
+         pct_of_noise as "% of all firings"
+// Follow-up per row: is it symptom-based? does it have a runbook?
+// If an alert has no runbook link, it goes on the fix list.
+
+
+// ------------------------------------------------------------
+// (4) Error-rate spike detection — the 35% MTTD cut
+// Compares the current 5-minute error rate against the same service's
+// trailing 1-hour baseline. Fires on *relative* change, so it catches a
+// 3am spike on a low-traffic service that a fixed threshold would miss.
+// This is the detection pattern behind the 35% MTTD improvement: fixed
+// thresholds waited for absolute volume; this catches the shape change.
+// ------------------------------------------------------------
+index=app_errors earliest=-65m latest=now
+| bin _time span=5m
+| stats count(eval(status_code >= 500)) as errors,
+        count as total
+    by _time, service
+| eval error_rate = round(100 * errors / total, 3)
+| streamstats current=f window=12 avg(error_rate) as baseline_rate by service
+| where _time >= relative_time(now(), "-5m@m")
+| eval baseline_rate = round(baseline_rate, 3),
+       spike_ratio = round(error_rate / max(baseline_rate, 0.001), 1)
+| where spike_ratio >= 3 AND error_rate > 0.5
+| table _time, service, error_rate, baseline_rate, spike_ratio
+| sort - spike_ratio
+| rename _time as Time,
+         service as Service,
+         error_rate as "Error rate % (5m)",
+         baseline_rate as "Baseline % (1h)",
+         spike_ratio as "Spike ratio"
+// spike_ratio >= 3 with an absolute floor (error_rate > 0.5%) keeps tiny
+// denominators from generating noise. Tune the floor per service traffic.

@@ -1,0 +1,120 @@
+# Node Saturation Alerts
+#
+# Symptom-adjacent, ticket-level alerts. These never page: a saturated node
+# is a cause, not a user-facing symptom. They exist so the platform team gets
+# a ticket with a runbook before the node starts evicting pods or the disk
+# fills at 3am.
+#
+# Thresholds are intentionally conservative with long `for:` durations —
+# saturation that clears itself in 10 minutes was never worth a ticket.
+#
+# Assumes node_exporter metrics.
+
+groups:
+  - name: node-saturation.rules
+    interval: 1m
+    rules:
+      # CPU: sustained >85% user+system across all cores for 15m.
+      # `irate` over 5m smooths scheduler noise; 15m `for:` skips deploys.
+      - alert: NodeCpuSaturation
+        expr: |
+          100 * (1 - avg by (instance) (
+            irate(node_cpu_seconds_total{mode="idle"}[5m])
+          )) > 85
+        for: 15m
+        labels:
+          severity: warning
+          tier: ticket
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: |
+            CPU usage above 85% for 15m. Check for runaway processes
+            (top, pidstat) or under-provisioned workloads. If this node runs
+            user workloads, consider cordon/drain and capacity review.
+            Current: {{ $value | humanize }}% used.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/runbooks/linux-high-cpu.md"
+
+      # Memory: >90% of *usable* memory consumed for 10m. Uses
+      # node_memory_MemAvailable_bytes so page cache doesn't false-positive.
+      - alert: NodeMemorySaturation
+        expr: |
+          100 * (1 - (
+            node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+          )) > 90
+        for: 10m
+        labels:
+          severity: warning
+          tier: ticket
+        annotations:
+          summary: "High memory pressure on {{ $labels.instance }}"
+          description: |
+            Available memory below 10% for 10m. Look for leaks or slab growth
+            before the OOM killer decides for you. Check swap activity too —
+            heavy swapping on a "90% used" box means it's worse than it looks.
+            Current: {{ $value | humanize }}% used.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/runbooks/linux-memory-pressure.md"
+
+      # Disk: two-tier approach. Warning at 80% (ticket, plenty of runway),
+      # critical at 90% but still a ticket — disk-full is predictable and
+      # should never be a 3am page if logrotate and journald are configured.
+      # Excludes tmpfs/overlay so container layers don't trip it.
+      - alert: NodeDiskSpaceWarning
+        expr: |
+          100 * (1 - (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay", mountpoint="/"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay", mountpoint="/"}
+          )) > 80
+        for: 30m
+        labels:
+          severity: warning
+          tier: ticket
+        annotations:
+          summary: "Disk space above 80% on {{ $labels.instance }}"
+          description: |
+            Root filesystem {{ $labels.mountpoint }} above 80% for 30m.
+            Find growth (ncdu/du), check logrotate status, vacuum the
+            journal. Current: {{ $value | humanize }}% used.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/runbooks/linux-disk-pressure.md"
+
+      - alert: NodeDiskSpaceCritical
+        expr: |
+          100 * (1 - (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay", mountpoint="/"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay", mountpoint="/"}
+          )) > 90
+        for: 10m
+        labels:
+          severity: critical
+          tier: ticket
+        annotations:
+          summary: "Disk space above 90% on {{ $labels.instance }} — act now"
+          description: |
+            Root filesystem {{ $labels.mountpoint }} above 90% for 10m.
+            Treat as urgent: vacuum journald, rotate/truncate the largest
+            logs, clear package caches. Still a ticket, not a page — but at
+            the top of the queue. Current: {{ $value | humanize }}% used.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/runbooks/linux-disk-pressure.md"
+
+      # Inode exhaustion: the silent disk-full. Separate alert because `df -h`
+      # looks fine while `df -i` is at 100%.
+      - alert: NodeInodeExhaustion
+        expr: |
+          100 * (1 - (
+            node_filesystem_files_free{fstype!~"tmpfs|overlay", mountpoint="/"}
+            /
+            node_filesystem_files{fstype!~"tmpfs|overlay", mountpoint="/"}
+          )) > 85
+        for: 30m
+        labels:
+          severity: warning
+          tier: ticket
+        annotations:
+          summary: "Inode usage above 85% on {{ $labels.instance }}"
+          description: |
+            Inodes {{ $labels.mountpoint }} above 85% for 30m — usually
+            millions of small files (sessions, cache, mail spool). Find the
+            directory with `find / -xdev -type d -size +100k` style checks.
+            Current: {{ $value | humanize }}% used.
+          runbook_url: "https://github.com/shaunnstjohn/sre-runbooks/blob/main/runbooks/linux-disk-pressure.md"
